@@ -26,6 +26,10 @@ const api = async (path, options = {}) => {
     const message = payload?.message || payload?.data?.message || `请求失败 (${response.status})`;
     throw new Error(message);
   }
+  if (isObject(payload) && typeof payload.code === 'number' && ![0, 200].includes(payload.code)) {
+    const message = payload?.data?.message || payload?.message || `请求失败 (${payload.code})`;
+    throw new Error(message);
+  }
   return payload;
 };
 
@@ -75,6 +79,8 @@ const splitTags = (value = '') => String(value).split(',').map((tag) => tag.trim
 const articleHref = (article) => `/article/${encodeURIComponent(article.alias || article.article_alias || article.id)}`;
 const imageUrl = (src) => src || FALLBACK_IMAGE;
 const viewCount = (n) => Number(n || 0) >= 1000 ? `${(Number(n) / 1000).toFixed(1)}k` : Number(n || 0);
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const unwrapEnvelope = (payload) => (isObject(payload) && 'code' in payload && 'data' in payload ? payload.data : payload);
 
 function shell(content) {
   return `
@@ -111,8 +117,8 @@ function bindShellEvents() {
       results.hidden = false;
       results.innerHTML = '<div class="search-item">扫描索引中...</div>';
       try {
-        const data = await api(`/api/articlesearch/search?keyword=${encodeURIComponent(keyword)}`);
-        const items = Array.isArray(data?.data) ? data.data : [];
+        const data = unwrapEnvelope(await api(`/api/articlesearch/search?keyword=${encodeURIComponent(keyword)}`));
+        const items = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
         results.innerHTML = items.length ? items.map((item) => `
           <a class="search-item" href="${articleHref(item)}" data-link>
             <b>${escapeHtml(item.title)}</b><br><span>${escapeHtml(item.excerpt || '')}</span>
@@ -135,9 +141,18 @@ async function bootstrapCommon() {
     api('/api/categoriesandcount'),
     api('/api/hot/articles'),
   ]);
-  if (user.status === 'fulfilled') state.user = { loggedIn: !!user.value?.loggedIn, username: user.value?.username || '' };
-  if (categories.status === 'fulfilled' && Array.isArray(categories.value)) state.categories = categories.value;
-  if (hot.status === 'fulfilled' && Array.isArray(hot.value)) state.hot = hot.value;
+  if (user.status === 'fulfilled') {
+    const userData = unwrapEnvelope(user.value);
+    state.user = { loggedIn: !!userData?.loggedIn, username: userData?.username || '' };
+  }
+  if (categories.status === 'fulfilled') {
+    const categoriesData = unwrapEnvelope(categories.value);
+    state.categories = Array.isArray(categoriesData) ? categoriesData : [];
+  }
+  if (hot.status === 'fulfilled') {
+    const hotData = unwrapEnvelope(hot.value);
+    state.hot = Array.isArray(hotData) ? hotData : [];
+  }
 }
 
 function hero(total = 0) {
@@ -217,8 +232,8 @@ async function renderList(loader, title, subtitle, base) {
   root.innerHTML = shell(`${hero(0)}<main class="shell layout"><section><div class="loading">loading articles...</div></section>${sidebar()}</main>`);
   bindShellEvents();
   try {
-    const data = await loader(page);
-    const items = Array.isArray(data?.data) ? data.data : [];
+    const data = unwrapEnvelope(await loader(page));
+    const items = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
     const total = Number(data?.total || items.length || 0);
     const totalPages = Number(data?.total_pages || 1);
     root.innerHTML = shell(`${hero(total)}<main class="shell layout"><section>
@@ -277,7 +292,7 @@ async function renderArticle() {
   root.innerHTML = shell('<main class="shell reader"><div class="loading">decrypt article...</div></main>');
   bindShellEvents();
   try {
-    const check = await api(`/api/article/${encodeURIComponent(alias)}/check-password`).catch(() => ({ needPassword: false }));
+    const check = unwrapEnvelope(await api(`/api/article/${encodeURIComponent(alias)}/check-password`).catch(() => ({ needPassword: false })));
     if (check?.needPassword) {
       root.innerHTML = shell(`<main class="shell auth-wrap"><section class="auth-card"><h2>需要文章密码</h2><form class="form" id="passwordForm"><label>password<input class="input" type="password" name="password" required></label><button class="btn primary">解密文章</button></form></section></main>`);
       bindShellEvents();
@@ -292,8 +307,7 @@ async function renderArticle() {
 }
 
 async function loadArticle(alias, password = '') {
-  const payload = await api(`/api/article/${encodeURIComponent(alias)}?password=${encodeURIComponent(password)}`);
-  const article = payload?.data || payload;
+  const article = unwrapEnvelope(await api(`/api/article/${encodeURIComponent(alias)}?password=${encodeURIComponent(password)}`));
   root.innerHTML = shell(`<main class="shell reader"><article class="article-shell terminal">
     <div class="article-hero">
       <div class="kicker">read.article // ${escapeHtml(article.category || 'uncategorized')}</div>
@@ -312,7 +326,7 @@ async function loadArticle(alias, password = '') {
 async function loadComments(alias) {
   const panel = document.getElementById('commentsPanel');
   try {
-    const comments = await api(`/api/comments/article/${encodeURIComponent(alias)}`);
+    const comments = unwrapEnvelope(await api(`/api/comments/article/${encodeURIComponent(alias)}`));
     panel.innerHTML = `<h3>评论</h3>${state.user.loggedIn ? `<form class="form" id="commentForm"><textarea class="textarea" name="content" rows="3" placeholder="写下你的评论..." required></textarea><input type="hidden" name="to_comment_id"><button class="btn primary">发表</button></form>` : `<div class="notice">登录后可以发表评论、点赞或删除自己的评论。<a href="/login" data-link>去登录</a></div>`}<div class="comment-list" style="margin-top:14px">${Array.isArray(comments) && comments.length ? comments.map((comment) => renderComment(comment, alias)).join('') : '<div class="empty">还没有评论，快来抢沙发吧！</div>'}</div>`;
     document.getElementById('commentForm')?.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -346,11 +360,12 @@ function renderComment(comment, alias) {
 }
 
 async function loadCaptcha(imgId = 'captchaImg') {
-  const data = await api('/api/captcha');
-  state.captcha = data;
+  const captcha = unwrapEnvelope(await api('/api/captcha'));
+  if (!captcha?.image || !captcha?.key) throw new Error('验证码响应格式异常');
+  state.captcha = captcha;
   const img = document.getElementById(imgId);
-  if (img) img.src = data.image;
-  return data;
+  if (img) img.src = captcha.image;
+  return captcha;
 }
 
 function renderAuth(mode) {
@@ -389,8 +404,8 @@ function renderAuth(mode) {
       if (form.get('phone')) body.phone = form.get('phone');
     }
     try {
-      const data = await api(isLogin ? '/api/login' : '/api/register', { method: 'POST', body: JSON.stringify(body) });
-      notice.textContent = data?.data?.message || (isLogin ? '登录成功' : '注册成功');
+      const data = unwrapEnvelope(await api(isLogin ? '/api/login' : '/api/register', { method: 'POST', body: JSON.stringify(body) }));
+      notice.textContent = data?.message || (isLogin ? '登录成功' : '注册成功');
       if (isLogin) {
         await bootstrapCommon();
         setTimeout(() => navigate('/'), 500);
@@ -417,8 +432,8 @@ async function renderSearchPage() {
   root.innerHTML = shell(`<main class="shell reader"><section class="panel"><h3>search: ${escapeHtml(keyword)}</h3><div class="loading">searching...</div></section></main>`);
   bindShellEvents();
   try {
-    const data = await api(`/api/articlesearch/search?keyword=${encodeURIComponent(keyword)}`);
-    const items = Array.isArray(data?.data) ? data.data : [];
+    const data = unwrapEnvelope(await api(`/api/articlesearch/search?keyword=${encodeURIComponent(keyword)}`));
+    const items = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
     root.innerHTML = shell(`<main class="shell layout"><section><div class="section-title"><div><h2>search.results</h2><p>${escapeHtml(keyword)}</p></div><span class="muted">${items.length} hits</span></div><div class="article-list">${items.length ? items.map(articleCard).join('') : '<div class="empty">没有匹配结果</div>'}</div></section>${sidebar()}</main>`);
     bindShellEvents();
   } catch (error) {
